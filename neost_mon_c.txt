@@ -1,0 +1,1118 @@
+#include "env_all.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <memory.h>
+#include <curl/curl.h>
+
+#ifdef POSIX_THR
+#include <pthread.h>
+#else
+#include <thread.h>
+#endif
+
+#include "common.h"
+#include "neohpcs.h"
+#include "neohpcs_cfg.h"
+#include "neohpcs_def.h"
+
+#ifdef _NOT_USE /* 20060728 cyteca */
+#include "neohpcs_dbg.c"		/* compile을 위해 추가 */
+#include "neohpcs_cfg.c"		/* compile을 위해 추가 */
+#include "neohpcs_def.c"		/* compile을 위해 추가 */
+#include "neohpcs_init.c"		/* compile을 위해 추가 */
+#include "neohpcs_sig.c"		/* compile을 위해 추가 */
+#endif
+
+#include <curses.h>
+#include "env_neost.h"
+#include "neo_profile.h"
+
+#ifndef _LINUX
+#include <sys/ipc_info.h>
+#endif /* _LINUX */
+
+#include <sys/types.h>
+#include <pwd.h>
+#include "libsystemlist.h"
+
+extern int statistic_shmkey;
+extern int proc_cnt;
+extern int max_conn;
+extern NEOHPCS_STATE_TBL *NST;
+
+extern int _neohpcs_cfg_parse();
+
+#ifdef NEOHPCS_NET_STATISTIC
+extern NEOHPCS_WRITER_STATISTIC neo_w_st;
+extern NEOHPCS_READER_STATISTIC neo_r_st;
+
+static NEOHPCS_WRITER_STATISTIC d_neo_w_st;
+static NEOHPCS_READER_STATISTIC d_neo_r_st;
+
+static int a_pos=0;
+static int a_cnt=0;
+
+#define MAX_AVR_CNT	10
+
+static NEOHPCS_WRITER_STATISTIC avr_w_st[MAX_AVR_CNT];
+static NEOHPCS_READER_STATISTIC avr_r_st[MAX_AVR_CNT];
+
+static NEOHPCS_WRITER_STATISTIC cur_avr_w_st;
+static NEOHPCS_READER_STATISTIC cur_avr_r_st;
+
+static NEOHPCS_WRITER_STATISTIC total_w_st;
+static NEOHPCS_READER_STATISTIC total_r_st;
+
+char output_file_name[256];
+FILE *O_FP;
+
+#endif
+
+#define DISP_COL	5
+int interval_sec=0;
+int sum_cnt=0;
+unsigned int disp_cnt;
+unsigned int disp_level;
+int l_shutdown;
+
+#ifdef NEOHPCS_NET_STATISTIC
+
+char g_cSystemName[64];
+char g_cSystemIP[64];
+char g_tmp[10][80];
+#define G64(index,value) GetSizeIndent64(g_tmp[index],value)
+#define G32(index,value) GetSizeIndent(g_tmp[index],value)
+
+#define SCS_PROJECT_CFG     "cfg/scs_project.cfg"
+
+WINDOW *W_NETST  = NULL;
+WINDOW *W_NETST2 = NULL;
+WINDOW *W_CONN   = NULL;
+WINDOW *W_PROCST = NULL;
+int pos_y=0;
+int pos_x=0;
+
+int pos_y2=0;
+int pos_x2=0;
+
+int exit_flg=0;
+int winch_flg=0;
+
+extern char *timestamp2();
+
+#define MAX_N_TITLE		27
+
+char USER_TITLE[MAX_STATISTIC_USER_PACKET][40];
+char n_title[MAX_N_TITLE][40];
+
+
+void *GetFastProfileSection();
+void *ProcFastProfile();
+
+int load_title(char *file_name)
+{
+	int i;
+	void *PH, *pSL;
+	static char *SECTION_USERDEF_TITLE="USER_DEFINE_TITLE";
+	static char *SECTION_NETWORK_TITLE="NETWORK_TITLE";
+	char title[256];
+	char topic[20];
+
+	PH = ProcFastProfile(file_name);
+	if (PH==NULL) return(-1);
+
+	pSL = GetFastProfileSection(PH,SECTION_NETWORK_TITLE);
+	if (pSL!=NULL) {
+		for(i=0;i<27;i++) {
+			sprintf(topic,"%02d",i);
+			if (GetFastProfileString(topic ,NULL,title ,sizeof(title)-1,pSL)) {
+				strncpy(n_title[i],title,39);
+			}
+		}    
+	}
+	pSL = GetFastProfileSection(PH,SECTION_USERDEF_TITLE);
+	if (pSL!=NULL) {
+		for(i=0;i<MAX_STATISTIC_USER_PACKET;i++) {
+			sprintf(topic,"%02d",i);
+			if (GetFastProfileString(topic ,NULL,title ,sizeof(title)-1,pSL)) {
+				strncpy(USER_TITLE[i],title,39);
+			}
+		}
+	}	
+	DestroyFastProfile(PH);
+	return(0);
+}
+
+void AddAvrStatict(d_w_st,d_r_st,w_st,r_st)
+NEOHPCS_WRITER_STATISTIC *d_w_st;
+NEOHPCS_READER_STATISTIC *d_r_st;
+NEOHPCS_WRITER_STATISTIC *w_st;
+NEOHPCS_READER_STATISTIC *r_st;
+{
+	int u;
+
+	d_r_st->packet_cnt           += r_st->packet_cnt;         
+	d_r_st->packet_byte          += r_st->packet_byte;        
+	d_r_st->packet_agin_cnt      += r_st->packet_agin_cnt;    
+	d_r_st->packet_intr_cnt      += r_st->packet_intr_cnt;    
+	d_r_st->packet_size_error    += r_st->packet_size_error;  
+	d_r_st->filter_error         += r_st->filter_error;
+	d_r_st->disconnect           += r_st->disconnect;         
+
+	for(u=0;u<MAX_STATISTIC_USER_PACKET;u++) {
+		d_r_st->packet_user[u] += r_st->packet_user[u];
+	}
+
+	d_w_st->tr_packet_cnt        += w_st->tr_packet_cnt;      
+	d_w_st->tr_packet_byte       += w_st->tr_packet_byte;     
+	d_w_st->tr_packet_agin_cnt   += w_st->tr_packet_agin_cnt; 
+	d_w_st->tr_packet_intr_cnt   += w_st->tr_packet_intr_cnt; 
+	d_w_st->qt_packet_cnt        += w_st->qt_packet_cnt;      
+	d_w_st->qt_packet_byte       += w_st->qt_packet_byte;     
+	d_w_st->qt_packet_agin_cnt   += w_st->qt_packet_agin_cnt; 
+	d_w_st->qt_packet_intr_cnt   += w_st->qt_packet_intr_cnt;
+	d_w_st->qt_packet_drop_cnt   += w_st->qt_packet_drop_cnt;
+	d_w_st->qt_packet_drop_bytes += w_st->qt_packet_drop_bytes;
+	d_w_st->qt_packet_drop_raw   += w_st->qt_packet_drop_raw;
+	d_w_st->qt_packet_len_drop_raw+= w_st->qt_packet_len_drop_raw;
+	d_w_st->qt_packet_seq_drop_raw+= w_st->qt_packet_seq_drop_raw;
+	d_w_st->qt_start_packet_retry_cnt  += w_st->qt_start_packet_retry_cnt;
+	d_w_st->qt_mid_packet_retry_cnt    += w_st->qt_mid_packet_retry_cnt;
+	d_w_st->loop_cnt            += w_st->loop_cnt;          
+	d_w_st->disconnect           += w_st->disconnect;         
+	d_w_st->qt_full_cnt                += w_st->qt_full_cnt;
+
+}
+
+void CulcAvrStatict(d_w_st,d_r_st,cnt)
+NEOHPCS_WRITER_STATISTIC *d_w_st;
+NEOHPCS_READER_STATISTIC *d_r_st;
+int cnt;
+{
+	int u;
+
+	d_r_st->packet_cnt           /= cnt;
+	d_r_st->packet_byte          /= cnt;        
+	d_r_st->packet_agin_cnt      /= cnt;
+	d_r_st->packet_intr_cnt      /= cnt;
+	d_r_st->packet_size_error    /= cnt;
+	d_r_st->filter_error         /= cnt;
+	d_r_st->disconnect           /= cnt;
+
+	for(u=0;u<MAX_STATISTIC_USER_PACKET;u++) {
+		d_r_st->packet_user[u] /= cnt;
+	}
+	d_w_st->tr_packet_cnt        /= cnt;
+	d_w_st->tr_packet_byte       /= cnt;
+	d_w_st->tr_packet_agin_cnt   /= cnt;
+	d_w_st->tr_packet_intr_cnt   /= cnt;
+	d_w_st->qt_packet_cnt        /= cnt;
+	d_w_st->qt_packet_byte       /= cnt;
+	d_w_st->qt_packet_agin_cnt   /= cnt; 
+	d_w_st->qt_packet_intr_cnt   /= cnt;
+	d_w_st->loop_cnt             /= cnt;
+	d_w_st->qt_packet_drop_cnt   /= cnt;
+	d_w_st->qt_packet_drop_bytes /= cnt;
+	d_w_st->qt_packet_drop_raw   /= cnt;
+	d_w_st->qt_packet_len_drop_raw/= cnt;
+	d_w_st->qt_packet_seq_drop_raw/= cnt;
+	d_w_st->qt_start_packet_retry_cnt  /= cnt;
+	d_w_st->qt_mid_packet_retry_cnt    /= cnt;
+	d_w_st->disconnect           /= cnt;
+	d_w_st->qt_full_cnt          /= cnt;
+}
+
+void AvrStatistic(d_w,d_r,max_cnt)
+NEOHPCS_WRITER_STATISTIC *d_w;
+NEOHPCS_READER_STATISTIC *d_r;
+int max_cnt;
+{
+	int i;
+	int max_pos; 
+	a_pos = (a_cnt++)%max_cnt;
+	AddAvrStatict(&total_w_st,&total_r_st,d_w,d_r);
+	memcpy(&avr_w_st[a_pos],d_w,sizeof(NEOHPCS_WRITER_STATISTIC));
+	memcpy(&avr_r_st[a_pos],d_r,sizeof(NEOHPCS_READER_STATISTIC));
+	memset(&cur_avr_w_st,0,sizeof(NEOHPCS_WRITER_STATISTIC));
+	memset(&cur_avr_r_st,0,sizeof(NEOHPCS_READER_STATISTIC));
+	max_pos = (a_cnt>max_cnt)?max_cnt:a_cnt;
+	for(i=0;i<max_pos;i++) {
+		AddAvrStatict(&cur_avr_w_st,&cur_avr_r_st,&avr_w_st[i],&avr_r_st[i]);
+	}
+	CulcAvrStatict(&cur_avr_w_st,&cur_avr_r_st,max_pos*interval_sec);
+}
+
+char *get_user_define_title(char *buffer,int id)
+{
+	if (USER_TITLE[id][0]) {
+		strcpy(buffer,USER_TITLE[id]);
+	} else {
+		sprintf(buffer,"READER USER_%d",id);
+	}
+	return(buffer);
+}
+
+void pushgateway(char* result){
+	CURL *curl;
+	CURLcode res;
+	char pushURL[50]="13.124.162.89:19091/metrics/job/push";
+	curl = curl_easy_init();                                        				// 세션시작
+	struct curl_slist *list = NULL;
+
+	if(curl){
+		curl_easy_setopt(curl, CURLOPT_URL, pushURL);
+		list = curl_slist_append(list, "Content-Type: application/json");			// 연결 목록 작성
+		curl_easy_setopt(curl, CURLOPT_POST, 1L);									// POST option
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, result));							// 결과값 추가
+		res = curl_easy_perform(curl);												// 데이터 전송 수행
+		curl_slist_free_all(list);													// 연결 목록 해제
+
+		if(res != CURLE_OK){
+			fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+			curl_easy_cleanup(curl);                        // 핸들 종료
+		}
+	}
+	curl_easy_cleanup(curl);
+}
+
+void DNSR(int n,long long t,long long c,long long d, char* result)
+{
+
+	char tmppp[60]={0,};
+	sprintf(tmppp, "pushTotal1{item=\"%s\"} %s\n", n_title[n], G64(0,t));
+	strcat(result,tmppp);
+
+	mvwprintw(W_NETST,pos_y+n,pos_x,"%-19s|%15s|%12s|%12s", n_title[n] , G64(0,t), G64(1,c), G64(2,d));
+	if (O_FP) {
+		fprintf(O_FP,"%s\t%s\t%s\t", G64(0,t), G64(1,c), G64(2,d));
+	}
+}
+
+#ifdef _USING_QUEUE_INFO_
+static int callback_QueData(void* pVA, void* pVB)
+{
+	ipcinfo_msg_t* pDA = (ipcinfo_msg_t*)pVA;
+	ipcinfo_msg_t* pDB = (ipcinfo_msg_t*)pVB;
+
+/*
+	if( pDA->rt_ipcx & IPCINFO_IPC_INUSE )
+		return -1;
+	if( pDB->rt_ipcx & IPCINFO_IPC_INUSE )
+		return -1;
+*/
+	if( pDA->msg_cbytes < pDB->msg_cbytes )
+		return 1;
+	if( pDA->msg_cbytes > pDB->msg_cbytes )
+		return -1;
+
+	return 0;
+}
+#endif /* _USING_QUEUE_INFO_ */
+
+typedef struct _tagDefines {
+	char  name[32];
+	ulong value;
+} tagDefine;
+tagDefine  g_defines[256];
+int        g_defcnt = 0;
+
+int _GET_CFG_SHARED_DATA()
+{
+	int cnt=0;
+	void *PH;
+	void *pSL;
+	void *pTP;
+	char *topicnm;
+	char *togoid;
+
+	char filepath[256];
+
+	sprintf(filepath, "%s/%s", _ST_GET_BASE_DIR(), SCS_SYSTEM_DEFINE_CFG);
+
+	PH = (void*)ProcFastProfile(filepath);
+	if( PH )
+	{
+		pSL  = (void*)GetFastProfileSection(PH,"DEFINE");
+		if( pSL )
+		{
+			pTP = (void*)GetFastNextProfileTopic(pSL, NULL);
+
+			while(pTP)
+			{
+				togoid = GetFastProfileTopicValueStr(pTP, NULL);
+				if( togoid )
+				{
+					topicnm = GetFastPrpofileNameByTopic(pTP);
+
+					strcpy( g_defines[cnt].name, topicnm);
+					g_defines[cnt].value = _ST_STR_TO_DECIMAL(togoid);
+					cnt++;
+				}
+				pTP = GetFastNextProfileTopic(pSL, pTP);
+			}
+		}
+		DestroyFastProfile(PH);
+	}
+	g_defcnt = cnt;
+	return cnt;
+}
+
+int GET_DEFINED_KEY(ulong vkey, char* name)
+{
+	int   inc;
+	ulong ckey;
+
+	for( inc=0; inc< g_defcnt; inc++ )
+	{
+		ckey = vkey & 0x00FFFF00;
+		if( ckey == g_defines[inc].value )
+		{
+			strcpy(name, g_defines[inc].name);
+			return inc;
+		}
+	}
+	return -1;
+}
+
+void DisplayNetStatistic()
+{
+	int i,u;
+	char tmp[80];
+	char simple_time[80];
+	
+	char *pushresult=malloc(sizeof(char)*1500);
+	memset(pushresult, 0, 1500*sizeof(char));
+
+	if (!disp_cnt) {
+		GetUpdateNeoStatisticDelta(&total_w_st,&total_r_st);
+		if (O_FP) {
+			fprintf(O_FP,"<<<%s>>>\n",timestamp2(tmp,sizeof(tmp)-1));
+			fprintf(O_FP,"TIME\t");  
+			fprintf(O_FP,"USER COUNT\t");
+
+			for(i=0;i<MAX_N_TITLE;i++) {
+				fprintf(O_FP,"%s\tDelta\tAvr\t",n_title[i]);  
+			}
+			for(u=0;u<MAX_STATISTIC_USER_PACKET;u++) {
+				if ((u+1)==MAX_STATISTIC_USER_PACKET) {
+					fprintf(O_FP,"%s\tDelta\tAvr\n",get_user_define_title(tmp,u));
+				} else {
+					fprintf(O_FP,"%s\tDelta\tAvr\t",get_user_define_title(tmp,u));
+				}
+			}
+		}
+		return;
+	} else {
+		int row=0;
+		long long tot_packet_cnt;
+		long long cur_packet_cnt;
+		long long avr_packet_cnt;
+
+		long long tot_packet_byte;
+		long long cur_packet_byte;
+		long long avr_packet_byte;
+
+		GetUpdateNeoStatisticDelta(&d_neo_w_st,&d_neo_r_st);
+		AvrStatistic(&d_neo_w_st,&d_neo_r_st,MAX_AVR_CNT);
+
+		tot_packet_cnt = total_w_st.tr_packet_cnt   + total_w_st.qt_packet_cnt;
+		cur_packet_cnt = d_neo_w_st.tr_packet_cnt   + d_neo_w_st.qt_packet_cnt;
+		avr_packet_cnt = cur_avr_w_st.tr_packet_cnt + cur_avr_w_st.qt_packet_cnt;
+
+		tot_packet_byte = total_w_st.tr_packet_byte   + total_w_st.qt_packet_byte;
+		cur_packet_byte = d_neo_w_st.tr_packet_byte   + d_neo_w_st.qt_packet_byte;
+		avr_packet_byte = cur_avr_w_st.tr_packet_byte + cur_avr_w_st.qt_packet_byte; 
+
+		pos_y = 1;
+		pos_x = 1;
+
+		if (O_FP) {
+			fprintf(O_FP,"%s\t%s\t",simple_time,G32(0,sum_cnt));
+		}
+		mvwprintw(W_NETST,pos_y++,pos_x," COUNT = %-6s    | %-26s | USER=%6s ", G32(0,a_cnt), timestamp_ext(tmp,sizeof(tmp)-1,simple_time), G32(2,sum_cnt));
+		mvwprintw(W_NETST,pos_y++,pos_x,"-------------------+---------------+------------+--------------");
+		mvwprintw(W_NETST,pos_y++,pos_x,"%-19s|%15s|%12s|%12s","Item","Total","Delta","AVR/(10 SEC)");
+		mvwprintw(W_NETST,pos_y++,pos_x,"-------------------+---------------+------------+--------------");
+		
+		DNSR(row++,total_r_st.packet_cnt               , d_neo_r_st.packet_cnt          , cur_avr_r_st.packet_cnt          , pushresult);
+		DNSR(row++,total_r_st.packet_byte              , d_neo_r_st.packet_byte         , cur_avr_r_st.packet_byte         , pushresult);
+		DNSR(row++,total_r_st.packet_agin_cnt          , d_neo_r_st.packet_agin_cnt     , cur_avr_r_st.packet_agin_cnt     , pushresult);
+		DNSR(row++,total_r_st.packet_intr_cnt          , d_neo_r_st.packet_intr_cnt     , cur_avr_r_st.packet_intr_cnt     , pushresult);
+		DNSR(row++,total_r_st.packet_size_error        , d_neo_r_st.packet_size_error   , cur_avr_r_st.packet_size_error   , pushresult);
+		DNSR(row++,total_r_st.filter_error             , d_neo_r_st.filter_error        , cur_avr_r_st.filter_error        , pushresult);
+		DNSR(row++,total_r_st.disconnect               , d_neo_r_st.disconnect          , cur_avr_r_st.disconnect          , pushresult);
+		DNSR(row++,tot_packet_cnt                      , cur_packet_cnt                 , avr_packet_cnt                   , pushresult);
+		DNSR(row++,tot_packet_byte                     , cur_packet_byte                , avr_packet_byte                  , pushresult);
+		DNSR(row++,total_w_st.tr_packet_cnt            , d_neo_w_st.tr_packet_cnt       , cur_avr_w_st.tr_packet_cnt       , pushresult);
+		DNSR(row++,total_w_st.tr_packet_byte           , d_neo_w_st.tr_packet_byte      , cur_avr_w_st.tr_packet_byte      , pushresult);
+		DNSR(row++,total_w_st.tr_packet_agin_cnt       , d_neo_w_st.tr_packet_agin_cnt  , cur_avr_w_st.tr_packet_agin_cnt  , pushresult);
+		DNSR(row++,total_w_st.tr_packet_intr_cnt       , d_neo_w_st.tr_packet_intr_cnt  , cur_avr_w_st.tr_packet_intr_cnt  , pushresult);
+		DNSR(row++,total_w_st.qt_packet_cnt            , d_neo_w_st.qt_packet_cnt       , cur_avr_w_st.qt_packet_cnt       , pushresult);
+		DNSR(row++,total_w_st.qt_packet_byte           , d_neo_w_st.qt_packet_byte      , cur_avr_w_st.qt_packet_byte      , pushresult);
+		DNSR(row++,total_w_st.qt_packet_agin_cnt       , d_neo_w_st.qt_packet_agin_cnt  , cur_avr_w_st.qt_packet_agin_cnt  , pushresult);
+		DNSR(row++,total_w_st.qt_packet_drop_cnt       , d_neo_w_st.qt_packet_drop_cnt  , cur_avr_w_st.qt_packet_drop_cnt  , pushresult);
+		DNSR(row++,total_w_st.qt_packet_drop_bytes     , d_neo_w_st.qt_packet_drop_bytes, cur_avr_w_st.qt_packet_drop_bytes, pushresult);
+		DNSR(row++,total_w_st.qt_packet_drop_raw       , d_neo_w_st.qt_packet_drop_raw  , cur_avr_w_st.qt_packet_drop_raw  , pushresult);
+		DNSR(row++,total_w_st.qt_packet_len_drop_raw   , d_neo_w_st.qt_packet_len_drop_raw, cur_avr_w_st.qt_packet_len_drop_raw, pushresult);
+		DNSR(row++,total_w_st.qt_packet_seq_drop_raw   , d_neo_w_st.qt_packet_seq_drop_raw, cur_avr_w_st.qt_packet_seq_drop_raw, pushresult);
+		DNSR(row++,total_w_st.qt_start_packet_retry_cnt,d_neo_w_st.qt_start_packet_retry_cnt,cur_avr_w_st.qt_start_packet_retry_cnt, pushresult);
+		DNSR(row++,total_w_st.qt_mid_packet_retry_cnt, d_neo_w_st.qt_mid_packet_retry_cnt, cur_avr_w_st.qt_mid_packet_retry_cnt, pushresult);
+		DNSR(row++,total_w_st.qt_packet_intr_cnt     , d_neo_w_st.qt_packet_intr_cnt     , cur_avr_w_st.qt_packet_intr_cnt     , pushresult);
+		DNSR(row++,total_w_st.loop_cnt               , d_neo_w_st.loop_cnt               , cur_avr_w_st.loop_cnt               , pushresult);
+		DNSR(row++,total_w_st.disconnect             , d_neo_w_st.disconnect             , cur_avr_w_st.disconnect             , pushresult);
+		DNSR(row++,total_w_st.qt_full_cnt            , d_neo_w_st.qt_full_cnt            , cur_avr_w_st.qt_full_cnt            , pushresult);
+
+			pushgateway(pushresult);
+			free(pushresult);
+
+		mvwprintw(W_NETST,(row+pos_y),pos_x,"-------------------------------------------------------------");
+
+#ifdef _USING_QUEUE_INFO_
+		/* Queue Info */
+		{
+			ipcinfo_msg_t* ipcmsg;
+			int            ipcmsg_cnt;
+			int            ret;
+			int            index = 0;
+			char           temp[64];
+
+			struct passwd  *pwddata;
+			char           q_owner[32];
+			char           k_name[32];
+
+			ipcmsg_cnt = 0;
+			get_ipc_info(0, GET_IPCINFO_MSG, IPCINFO_MSG_VERSION, NULL, &ipcmsg_cnt);
+
+			ipcmsg = malloc( sizeof(ipcinfo_msg_t) * ipcmsg_cnt );
+			memset(ipcmsg, 0x00, sizeof(ipcinfo_msg_t) * ipcmsg_cnt );
+
+			ret = get_ipc_info(0, GET_IPCINFO_MSG, IPCINFO_MSG_VERSION, (char*)ipcmsg, &ipcmsg_cnt);
+			if( ret == 0 && ipcmsg_cnt > 0 )
+			{
+				int i=0;
+
+				qsort(ipcmsg, ipcmsg_cnt, sizeof(ipcinfo_msg_t), callback_QueData);
+
+				/* if( ipcmsg[0].msg_qnum > 0 ) */
+				{
+					row++;
+
+					/* mvwprintw(W_NETST,(row+pos_y),pos_x,"- Queue Info ------------------------------------------------"); */
+					/* row++; */
+					mvwprintw(W_NETST,(row+pos_y),pos_x,"%-10s %-8s  %-12s %-8s %7s %7s ",
+						"Queue-ID",
+						"Queue-Key",
+						"Def-Key",
+						"Owner",
+						"QNum",
+						"QBytes"
+					);
+					row++;
+					mvwprintw(W_NETST,(row+pos_y),pos_x,"-------------------------------------------------------------");
+					row++;
+
+					for( i=0; i< ipcmsg_cnt; i++ )
+					{
+						if( i >= 10 )
+							break;
+						if( ipcmsg[i].msg_perm.key == 0 )
+							continue;
+
+						pwddata = (struct passwd*)getpwuid(ipcmsg[i].msg_perm.uid);
+						strcpy(q_owner, pwddata->pw_name);
+
+						k_name[0] = 0;
+						GET_DEFINED_KEY(ipcmsg[i].msg_perm.key, k_name);
+
+						mvwprintw(W_NETST,(row+pos_y),pos_x,"%-10d 0x%08x %-12.12s %-8.8s %7d %7d ",
+							ipcmsg[i].msg_id,
+							ipcmsg[i].msg_perm.key,
+							k_name,
+							q_owner,
+							ipcmsg[i].msg_qnum,
+							ipcmsg[i].msg_cbytes
+						);
+						row++;
+					}
+				}
+			}
+
+			free(ipcmsg);
+		}
+		mvwprintw(W_NETST,(row+pos_y),pos_x,"-------------------------------------------------------------");
+#endif /* _USING_QUEUE_INFO_ */
+
+		wborder(W_NETST,'|','|','-','-','+','+','+','+');
+		wrefresh(W_NETST);
+		if (O_FP) {
+			fflush(O_FP);
+		}
+	}
+}
+
+void DisplayNetStatistic2()
+{
+	int i,u;
+	char tmp[80];
+	char simple_time[80];
+
+	char x1[2500]={0,};
+	char x2[60]={0,};
+
+	if (!disp_cnt) {
+	/*	
+	GetUpdateNeoStatisticDelta(&total_w_st,&total_r_st);
+	*/
+		if (O_FP) {
+			fprintf(O_FP,"<<<%s>>>\n",timestamp2(tmp,sizeof(tmp)-1));
+			fprintf(O_FP,"TIME\t");  
+			fprintf(O_FP,"USER COUNT\t");
+
+			for(i=0;i<MAX_N_TITLE;i++) {
+				fprintf(O_FP,"%s\tDelta\tAvr\t",n_title[i]);  
+			}
+			for(u=0;u<MAX_STATISTIC_USER_PACKET;u++) {
+				if ((u+1)==MAX_STATISTIC_USER_PACKET) {
+					fprintf(O_FP,"%s\tDelta\tAvr\n",get_user_define_title(tmp,u));
+				} else {
+					fprintf(O_FP,"%s\tDelta\tAvr\t",get_user_define_title(tmp,u));
+				}
+			}
+		}
+		return;
+	} else {
+		int row=0;
+#ifdef _NOT_USED
+		long long tot_packet_cnt;
+		long long cur_packet_cnt;
+		long long avr_packet_cnt;
+
+		long long tot_packet_byte;
+		long long cur_packet_byte;
+		long long avr_packet_byte;
+		/*
+		GetUpdateNeoStatisticDelta(&d_neo_w_st,&d_neo_r_st);
+		*/
+
+		tot_packet_cnt = total_w_st.tr_packet_cnt   + total_w_st.qt_packet_cnt;
+		cur_packet_cnt = d_neo_w_st.tr_packet_cnt   + d_neo_w_st.qt_packet_cnt;
+		avr_packet_cnt = cur_avr_w_st.tr_packet_cnt + cur_avr_w_st.qt_packet_cnt;
+
+		tot_packet_byte = total_w_st.tr_packet_byte   + total_w_st.qt_packet_byte;
+		cur_packet_byte = d_neo_w_st.tr_packet_byte   + d_neo_w_st.qt_packet_byte;
+		avr_packet_byte = cur_avr_w_st.tr_packet_byte + cur_avr_w_st.qt_packet_byte; 
+#endif
+
+		pos_y = 1;
+		pos_x = 1;
+
+		if (O_FP) {
+			fprintf(O_FP,"%s\t%s\t",simple_time,G32(0,sum_cnt));
+		}
+
+		mvwprintw(W_NETST2,pos_y++,pos_x," IP: %-16s %16s Host: %16s", g_cSystemIP, " ", g_cSystemName);
+
+		mvwprintw(W_NETST2,pos_y++,pos_x,"-------------------+---------------+------------+--------------");
+		mvwprintw(W_NETST2,pos_y++,pos_x,"%-19s|%15s|%12s|%12s","Item","Total","Delta","AVR/(10 SEC)");
+		mvwprintw(W_NETST2,pos_y++,pos_x,"-------------------+---------------+------------+--------------");
+		for(u=0;u<MAX_STATISTIC_USER_PACKET;u++) {
+
+			sprintf(x2, "pushTotal2{item=\"%s\"} %s\n", get_user_define_title(tmp,u), G64(0,total_r_st.packet_user[u]));
+			strcat(x1,x2);
+			memset(x2, 0, 60*sizeof(char));
+
+			mvwprintw(W_NETST2,pos_y + row++,pos_x,"%-19s|%15s|%12s|%12s",get_user_define_title(tmp,u),G64(0,total_r_st.packet_user[u]),G64(1,d_neo_r_st.packet_user[u]),G64(2,cur_avr_r_st.packet_user[u])); 
+			if (O_FP) {
+				if ((u+1)==MAX_STATISTIC_USER_PACKET) {
+					fprintf(O_FP,"%s\t%s\t%s\n",G64(0,total_r_st.packet_user[u]),G64(1,d_neo_r_st.packet_user[u]),G64(2,cur_avr_r_st.packet_user[u])); 
+				} else {
+					fprintf(O_FP,"%s\t%s\t%s\t",G64(0,total_r_st.packet_user[u]),G64(1,d_neo_r_st.packet_user[u]),G64(2,cur_avr_r_st.packet_user[u])); 
+				}
+			}
+		}
+
+		pushgateway(x1);
+
+		wborder(W_NETST2,'|','|','-','-','+','+','+','+');
+		wrefresh(W_NETST2);
+		if (O_FP) {
+			fflush(O_FP);
+		}
+	}
+}
+#endif
+
+int accept_enable_cnt;
+int accept_wait;
+int old_session_cnt[256]={0,};
+int session_delta[256]={0,};
+int session_delta_cnt;
+int cur_accept_group;
+int max_star_len;
+
+void DisplayConnStatistic()
+{
+	char buffer[1024]={0,};
+	char tmp[256];
+	int i,j;
+	int session_cnt;
+	int group_id;
+	char a_state;
+	char a_state_ext;
+
+	if (!disp_cnt) return;
+	pos_x = 1;
+	pos_y = 1;
+
+	mvwprintw(W_CONN,pos_y++,pos_x, " |NUM|   PID  |USR| 0         50        100      150       200      250|Delta");
+	mvwprintw(W_CONN,pos_y++,pos_x, "-+---+--------+---+-+----------+----------+--------+---------+---------+-----");
+	accept_enable_cnt=0;
+	accept_wait=0;
+	buffer[max_star_len] =0;
+
+	for (i=0; i < proc_cnt; i++) {
+		group_id = i + 1;
+		memset(buffer,' ',max_star_len);
+		buffer[max_star_len]=0;
+		session_cnt = NST->nsg[i].session_cnt;
+		cur_accept_group = NST->cur_accept_group;
+		for(j=0;j<session_cnt;j++) {
+			buffer[j/DISP_COL]='*';
+		}
+		if (group_id == cur_accept_group) {
+			a_state='A';
+			a_state_ext='>';
+			accept_wait++;
+		} else {
+			if (NST->nsg[i].accept_able) {
+				a_state='E';
+				accept_enable_cnt++;
+			} else {
+				a_state=' ';
+			}
+			a_state_ext=' ';
+		}
+		session_delta[i]=session_cnt-old_session_cnt[i];
+		old_session_cnt[i]=session_cnt;
+		if (session_delta[i]>=0) session_delta_cnt += session_delta[i];
+		else session_delta_cnt -= session_delta[i];
+		sprintf(tmp,"%d",session_delta[i]);
+		if (kill(NST->nsg[i].accept_pid,0)>=0) {
+			mvwprintw(W_CONN,pos_y++,pos_x,"%c|%3d|%8d|%3d|%c|%s|%4s",a_state_ext,group_id,
+				NST->nsg[i].accept_pid, session_cnt, a_state,buffer, tmp);
+		} else {
+			mvwprintw(W_CONN,pos_y++,pos_x,"%c[%3d] KILLED[___][ ] : ",a_state_ext,group_id);
+		}
+		/* sum_cnt += session_cnt; */
+	}
+	wborder(W_CONN,'|','|','-','-','+','+','+','+');
+	wrefresh(W_CONN);
+}
+
+void DisplayProcStatistic()
+{
+	int lock_check_flg;
+	struct timeval ttv;
+	struct tm t_tm;
+	char accept_change_time_buffer[256];
+
+	if (!disp_cnt) return;
+	pos_y = 1;
+	pos_x = 1;
+	ttv = NST->accept_change_time;
+	localtime_r(&ttv.tv_sec,&t_tm);
+	sprintf(accept_change_time_buffer,"%02d:%02d:%02d.%03d",t_tm.tm_hour,t_tm.tm_min,t_tm.tm_sec,(int)(ttv.tv_usec/1000));
+
+	if (NST->check_accept_cnt>DEFAULT_ACCEPT_LOCK_RECOVERY_CHECK_CNT) lock_check_flg = 1;
+	else lock_check_flg=0;
+
+	mvwprintw(W_PROCST,pos_y++,pos_x," REINVOKED_PROCESS |  TOTAL_SESSION  |  SESSION_DELTA  |CHECK_ACCEPT_CNT ");
+	mvwprintw(W_PROCST,pos_y++,pos_x,"-----------------------------------------------------------------------------");
+	mvwprintw(W_PROCST,pos_y++,pos_x,"%19s|%17s|%17s|%17s",
+		G32(0,NST->reinvoked_cnt), G32(1,sum_cnt) , G32(2,session_delta_cnt), G32(3,NST->check_accept_cnt));
+	mvwprintw(W_PROCST,pos_y++,pos_x,"------------------------------------------------------------------------------");
+	mvwprintw(W_PROCST,pos_y++,pos_x," CHECK_ACCEPT_RESULT   | %s %s", 
+				lock_check_flg?"CHECKED!!!":"OK",
+				lock_check_flg?accept_change_time_buffer:""
+	);
+	mvwprintw(W_PROCST,pos_y++,pos_x,"------------------------------------------------------------------------------");
+
+	mvwprintw(W_PROCST,pos_y++,pos_x," ACCEPT_ENABLE_CNT | %2d| ACCEPT_GROUP_ID(CUR/OLD) | %2d/%2d",
+			accept_enable_cnt,cur_accept_group,NST->old_accept_group);
+	mvwprintw(W_PROCST,pos_y++,pos_x," ACCEPT_WAIT       | %2d| ACCEPT_WAIT_TIME         | %5d",
+			accept_wait,NST->accept_wait_time      );
+	mvwprintw(W_PROCST,pos_y++,pos_x,"------------------------------------------------------------------------------");
+	mvwprintw(W_PROCST,pos_y++,pos_x," ACCEPT_LOCK_RECOVERY_CNT| LOCK_RECOVERY_FAILED | LOCK_RECOVERY_PENDING");
+
+	mvwprintw(W_PROCST,pos_y++,pos_x,"%25s|%22s|%24s",
+			G32(0,NST->lock_recovery_cnt),G32(1,NST->lock_recovery_failed),G32(2,NST->lock_recovery_pending));
+	wborder(W_PROCST,'|','|','-','-','+','+','+','+');
+	wrefresh(W_PROCST);
+}
+
+
+void usage()
+{
+	fprintf(stderr, "scs_neost -i $WORKUSER\n");
+	fprintf(stdout, "*-- SmartCS Version 및 설치일자\n");
+	fprintf(stderr, "scs_neost -c config filename\n");
+	fprintf(stdout, "*-- add_qt_queue (Queue를 이용한 실시간) \n");
+	fprintf(stdout, "WRITER PS DROP CNT   - "
+						"재시도 횟수를 넘어서 Drop 되는 개수\n");
+	fprintf(stdout, "WRITER PS DROP BYTE  - "
+						"재시도 횟수를 넘어서 Drop 되는 바이트\n");
+	fprintf(stdout, "\n");
+	fprintf(stdout, "*-- add_qt_queue_raw (neosq를 이용한 실시간)\n");
+	fprintf(stdout, "WRITER PS DROP RAW   - "
+						"패킷 Drop시 횟수 증가 ( LDROP_RAW + SDROP_RAW )\n");
+	fprintf(stdout, "WRITER PS LDROP RAW  - "
+						"패킷 Length이후를 보내고 Drop되는 Count(패킷이 짤림-> eagain발생)\n");
+	fprintf(stdout, "WRITER PS SDROP RAW  - "
+						"패킷의 Length만큼 보낸 상태에서 재시도 횟수를 넘어서 Drop되는 Count(패킷단위로 맞춰서 보내짐)\n");
+	fprintf(stdout, "WRITER PS S RETRY    - "
+						"재시도 시도시 횟수 증가\n");
+	fprintf(stdout, "WRITER PS M RETRY    - "
+						"eagain발생으로인해 재시도 되는 횟수 \n");
+
+	fflush(stderr);
+	exit(-1);
+}
+
+void SigFunc(int signo)
+{
+    exit_flg=1;
+}
+
+void SIG_WINCH(int signo)
+{
+	winch_flg = 1;
+	signal(SIGWINCH, SIG_WINCH);
+}
+
+int shutdownprogress(int l_level)
+{
+	int l_live;
+	int i;
+	int cnt=0;
+	int timeout=0;
+
+	fprintf(stdout,"SHUTDOWN LEVEL %d\n",l_level);
+	fflush(stdout);
+	fprintf(stdout,"SHUTDOWN PROGRESS!!!!!\n");
+	fflush(stdout);
+
+	SetHPCSShutDownLevel(l_level);
+	if (l_level>8) {
+		do {
+			l_live=0;
+#ifdef _NOT_USE_	// 20130304 PHS : SPARROW
+			if (!l_live) {
+				fprintf(stdout,"*");
+				fflush(stdout);
+			}
+#endif
+			for (i=0; i < proc_cnt; i++) {
+				if (kill(NST->nsg[i].accept_pid,0)>=0) {
+					l_live++;
+				}
+			}
+			neo_sleep(1000);
+			if (cnt++>10) {
+				timeout=1;
+				break;
+			}
+		} while(l_live);
+	}
+	if (!timeout) {
+		fprintf(stdout,"\nSHUTDOWN COMPLETE!!!!\n");
+		fflush(stdout);
+	} else {
+		fprintf(stdout,"\nSHUTDOWN TIMEOUT!!!!\n");
+		fflush(stdout);
+		switch(l_level) {
+			case 9:
+				for (i=0; i < proc_cnt; i++) {
+					kill(NST->nsg[i].accept_pid,9);
+				}
+				neo_sleep(1000);
+				fprintf(stdout,"\nTRY PCINETD GROUP ABORTED COMPLETE!!!!\n");
+				fflush(stdout);
+				break;
+			case 15:
+				for (i=0; i < proc_cnt; i++) {
+					kill(NST->nsg[i].accept_pid,15);
+				}
+				neo_sleep(1000);
+				fprintf(stdout,"\nTRY PCINETD GROUP KILL COMPLETE!!!!\n");
+				fflush(stdout);
+				break;
+		}
+	}
+	return(0);
+}
+
+int INIT_W_CONN(int pos_y)
+{
+	W_CONN   = newwin(proc_cnt+4,79, pos_y,0);
+	return(proc_cnt+3);
+}
+
+int INIT_W_PROCST(int pos_y)
+{
+	W_PROCST = newwin(13 ,79,pos_y,0);
+	return(13);
+}
+
+int INIT_W_NETST(int pos_y)
+{
+	W_NETST   = newwin(50,64,pos_y,0);
+	W_NETST2  = newwin(50,64,pos_y,64);
+	return(50);
+}
+
+int init_screen(int disp_level)
+{
+	pos_y = 0;
+
+	if( W_CONN || W_PROCST || W_NETST || W_NETST2 )
+		endwin();
+
+	if( W_CONN )
+		delwin(W_CONN);
+	if( W_PROCST )
+		delwin(W_PROCST);
+	if( W_NETST )
+		delwin(W_NETST);
+	if( W_NETST2 )
+		delwin(W_NETST2);
+
+	if (disp_level<=4) {
+		initscr();
+		/* cbreak(); */
+
+		pos_y = 0;
+		switch(disp_level) {
+		case 0:
+		case 1:
+			INIT_W_CONN(pos_y);
+			break;
+		case 2:
+			pos_y+= INIT_W_CONN(pos_y);
+			pos_y+= INIT_W_PROCST(pos_y);
+			break;
+		case 3:
+			pos_y  += INIT_W_NETST(pos_y);
+			break;
+		case 4:
+			pos_y+= INIT_W_NETST(pos_y);
+			/* pos_y+= INIT_W_CONN(pos_y); */
+			pos_y+= INIT_W_PROCST(pos_y);
+			break;
+		}
+	}
+	return 0;
+}
+
+int
+main(argc, argv)
+int argc;
+char **argv;
+{
+	int optchr;
+	int errflag = 0;
+	char cfgfilename[1024]={0,};
+	char deffilename[1024]={0,};
+	char prjfilename[1024]={0,};
+	char errmsg[BUFSIZ];
+	int session_cnt;
+#ifdef NEOHPCS_NET_STATISTIC
+	int clear_statistic=0;
+#endif
+
+	char optstring[80];
+	extern int optind;
+	extern char *optarg;
+	int i;
+	int hup_flg = 0;
+
+	signal(SIGWINCH, SIG_WINCH);
+
+	_ST_SET_PGNAME(argv[0], NULL);
+
+	/* System Infomation */
+	_ST_GET_SYSTEM_NAME(g_cSystemName);
+	_ST_GET_IP_ADDRESS(g_cSystemName, g_cSystemIP);
+
+	_ST_GET_WORK_USER_BY_ENV(_TRANS_WORKHOMED, _ST_GET_BASE_DIR());
+
+	//sprintf(optstring, "%s", "P:c:x:s:d:r:o:i:k:q:");
+	sprintf(optstring, "%s", "i:P:c:x:s:d:r:o:k:q:");
+
+	_GET_CFG_SHARED_DATA();
+
+	if (argc <= 1) usage();
+	while ((optchr = getopt(argc, argv, optstring)) != EOF) {
+		switch(optchr) {
+			case 'i':
+				fprintf(stdout,"SmartCS Release 2.1.6\n");
+				fprintf(stdout,"하나금융투자 project-license 2015/04/13\n");
+				fprintf(stdout,"본 제품은 하나금융투자에서만 사용이 가능함.\n");
+				fflush(stdout);
+				return(0);
+/*
+			case 'c':
+				cfgfilename = optarg;
+				break;
+*/
+			case 'P':
+				strcpy(cfgfilename, optarg);
+				strcat(cfgfilename, "/cfg/scs_dm_pcinetd.cfg");
+				strcpy(deffilename, optarg);
+				strcat(deffilename, "/cfg/scs_systemdefine.cfg");
+				strcpy(prjfilename, optarg);
+				strcat(prjfilename, "/cfg/scs_project.cfg");
+				break;
+			case 's':
+				interval_sec = atoi(optarg);
+				break;
+			case 'd':
+				disp_level = atoi(optarg);
+				break;
+			case 'r':
+				clear_statistic= atoi(optarg);
+				break;
+			case 'o':
+				strcpy(output_file_name,optarg);
+				break;
+			case 'q':
+				hup_flg = 1;
+				break;
+			case 'k':
+				l_shutdown = atoi(optarg);
+				break;
+			default :
+				errflag = 1;
+				break;
+		}
+	}
+	if (optind != argc || errflag) usage();
+
+	/* config read */
+	load_title(cfgfilename);
+
+	/* ADD NEOFRAME LCLASSER 20090527 #1 : HPCS 적용 */
+	if (_neohpcs_project_cfg_parse(prjfilename, errmsg) < 0) {
+		fprintf(stderr, "prj : %s\n", errmsg);
+		fflush(stderr);
+		exit(-1);
+	}
+	if (_neohpcs_cfg_parse(cfgfilename, deffilename, errmsg) < 0) {
+		fprintf(stderr, "cfg : %s\n", errmsg);
+		fflush(stderr);
+		exit(-1);
+	}
+	if (INIT_NEOHPCS_STATE_SHM(0,errmsg)<0) {
+		fprintf(stderr,"shm : %s\n",errmsg);
+		fflush(stderr);
+		exit(-1);
+	}
+#ifdef NEOHPCS_NET_STATISTIC
+	if (clear_statistic) {
+		for (i=0; i < proc_cnt; i++) {
+			memset(&NST->nsg[i].neo_w_st,0,sizeof(NEOHPCS_WRITER_STATISTIC));
+			memset(&NST->nsg[i].neo_r_st,0,sizeof(NEOHPCS_READER_STATISTIC));
+		}
+
+		exit(-1);
+	}
+	if (output_file_name[0]) {
+		O_FP=fopen(output_file_name,"w");
+	}
+#endif
+	if (hup_flg) {
+		IncHPCSHupCnt();
+		fprintf(stderr, "INETD SEND HANGUP!!!!\n");
+		fflush(stderr);
+		return(0);
+	}
+	if (l_shutdown) {
+		shutdownprogress(l_shutdown);
+		return(0);
+	}
+	(void)sigset(SIGHUP, SIG_IGN);
+	(void)sigset(SIGCLD, SIG_IGN);
+	(void)sigset(SIGPIPE, SIG_IGN);
+	(void)sigset(SIGALRM, SIG_IGN);
+	(void)sigset(SIGINT , SigFunc);
+	(void)sigset(SIGKILL, SigFunc);
+	(void)sigset(SIGTERM, SigFunc);
+
+	init_screen(disp_level);
+
+	max_star_len = NST->max_group_session/DISP_COL;
+	do {
+		session_delta_cnt=0;
+		sum_cnt = 0;
+
+		if( winch_flg )
+		{
+			init_screen(disp_level);
+			winch_flg = 0;
+		}
+
+		for (i=0; i < proc_cnt; i++) {
+			session_cnt = NST->nsg[i].session_cnt;
+			session_delta[i]=session_cnt-old_session_cnt[i];
+			old_session_cnt[i]=session_cnt;
+			if (session_delta[i]>=0) session_delta_cnt += session_delta[i];
+			else session_delta_cnt -= session_delta[i];
+/*			sum_cnt += session_cnt; */
+		}
+		for (i=0; i < proc_cnt; i++) {
+			sum_cnt += NST->nsg[i].session_cnt;
+		}
+		if (W_NETST) {
+			DisplayNetStatistic();
+			DisplayNetStatistic2();
+		}
+		if (W_CONN) {
+			DisplayConnStatistic();
+		} 
+		if (W_PROCST) {
+			DisplayProcStatistic();
+		}
+		if (disp_level>=5) {
+			fprintf(stdout,"%d\t%d\n",++a_cnt,sum_cnt);
+			fflush(stdout);
+		}
+		disp_cnt++;
+		if (interval_sec) {
+			neo_sleep(interval_sec*1000);
+		}
+		if (exit_flg) break;
+	}
+	while(interval_sec);
+
+	if (W_NETST || W_CONN || W_PROCST) {
+		endwin();
+		/* curs_set(1); */
+
+		if( W_CONN )
+			delwin(W_CONN);
+		if( W_PROCST )
+			delwin(W_PROCST);
+		if( W_NETST )
+			delwin(W_NETST);
+		if( W_NETST2 )
+			delwin(W_NETST2);
+	}
+	return(0);
+}
+
+#ifdef NOT_USE
+NCURSES_EXPORT(WINDOW *) initscr (void)
+{
+	return(0);
+}
+#endif
